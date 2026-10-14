@@ -122,13 +122,20 @@ async function askAI({ message, mode, language, history = [] }) {
     payload = { model: MODEL, instructions, input: turns, max_output_tokens: 1000 };
     extract = d => d.output_text || (d.output || []).flatMap(o => o.content || []).filter(c => c.type === "output_text").map(c => c.text).join("\n");
   }
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
-  const data = await response.json().catch(() => ({}));
+  // Retry on temporary provider overload (500/502/503/504) before giving up
+  let response, data;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    response = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    data = await response.json().catch(() => ({}));
+    if (response.ok || ![500, 502, 503, 504].includes(response.status) || attempt === 4) break;
+    console.warn(`[AI ${PROVIDER}] ${response.status}, retry ${attempt}/3...`);
+    await new Promise(r => setTimeout(r, attempt * 2000));
+  }
   if (!response.ok) {
     const detail = data?.error?.message || data?.error || "AI_REQUEST_FAILED";
     console.error(`[AI ${PROVIDER}] ${response.status}:`, typeof detail === "string" ? detail : JSON.stringify(detail));
     const error = new Error(typeof detail === "string" ? detail : "AI_REQUEST_FAILED");
-    error.status = response.status === 429 ? 429 : 502;
+    error.status = response.status === 429 ? 429 : response.status === 503 ? 503 : 502;
     throw error;
   }
   const text = extract(data);
@@ -163,6 +170,7 @@ const server = http.createServer(async (req, res) => {
         const msg = e.message === "AI_NOT_CONFIGURED"
           ? "AI әлі қосылмаған. Жоба иесі .env файлына API кілтін (GEMINI_API_KEY, OPENAI_API_KEY немесе ANTHROPIC_API_KEY) қосуы керек."
           : status === 429 ? "AI сұранысы уақытша шектелді. Біраздан соң қайталап көр."
+          : status === 503 ? "AI қазір тым бос емес (Google жағындағы уақытша жүктеме). 1-2 минуттан кейін қайталап көр."
           : "AI қызметіне қосылу сәтсіз аяқталды. API кілтін, интернетті және есептік жазба баптауларын тексер.";
         return json(res, status, { error: msg });
       }
