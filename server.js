@@ -7,29 +7,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
 const COUNTER_FILE = path.join(DATA_DIR, "visitors.json");
-
-// Load .env manually (Node does not read .env by itself without --env-file)
-try {
-  const envText = await fs.readFile(path.join(__dirname, ".env"), "utf8");
-  for (const line of envText.split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/i);
-    if (m && !line.trim().startsWith("#") && process.env[m[1]] === undefined) {
-      process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
-    }
-  }
-} catch { /* no .env file - use real environment variables */ }
-
 const PORT = Number(process.env.PORT || 3000);
-const KEYS = {
-  gemini: process.env.GEMINI_API_KEY || "",
-  openai: process.env.OPENAI_API_KEY || "",
-  anthropic: process.env.ANTHROPIC_API_KEY || ""
-};
-const isReal = k => k && !k.startsWith("put_your") && k.length > 15;
-const PROVIDER = (process.env.AI_PROVIDER || ["gemini", "openai", "anthropic"].find(p => isReal(KEYS[p])) || "").toLowerCase();
-const API_KEY = isReal(KEYS[PROVIDER]) ? KEYS[PROVIDER] : "";
-const DEFAULT_MODELS = { gemini: "gemini-2.5-flash", openai: "gpt-4.1-mini", anthropic: "claude-haiku-5-5" };
-const MODEL = process.env.AI_MODEL || DEFAULT_MODELS[PROVIDER] || "";
+const API_KEY = process.env.GROQ_API_KEY || "";
+const MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 const mime = {
   ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
   ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8",
@@ -41,17 +21,6 @@ async function readCounter() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   try { return JSON.parse(await fs.readFile(COUNTER_FILE, "utf8")); }
   catch { return { totalVisits: 0 }; }
-}
-let counterQueue = Promise.resolve();
-function incrementVisits() {
-  const task = counterQueue.then(async () => {
-    const data = await readCounter();
-    data.totalVisits = (Number(data.totalVisits) || 0) + 1;
-    await saveCounter(data);
-    return data.totalVisits;
-  });
-  counterQueue = task.catch(() => {});
-  return task;
 }
 async function saveCounter(data) {
   await fs.mkdir(DATA_DIR, { recursive: true });
@@ -97,63 +66,43 @@ async function askAI({ message, mode, language, history = [] }) {
   ).map(x => ({ role: x.role, content: x.content.slice(0, 1800) })) : [];
   const instructions = `${modes[mode] || modes.tutor}\nTarget language: ${String(language || "English").slice(0, 50)}.\nKeep answers useful and readable. Do not claim to be human.`;
   const input = [...safeHistory, { role: "user", content: String(message || "").slice(0, 3500) }];
-  const userText = String(message || "").slice(0, 3500);
-  let turns = [...safeHistory, { role: "user", content: userText }];
-  // Providers require the conversation to start with a user turn
-  while (turns.length > 1 && turns[0].role !== "user") turns.shift();
-  let url, headers, payload, extract;
-  if (PROVIDER === "gemini") {
-    url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`;
-    headers = { "Content-Type": "application/json", "x-goog-api-key": API_KEY };
-    payload = {
-      systemInstruction: { parts: [{ text: instructions }] },
-      contents: turns.map(t => ({ role: t.role === "assistant" ? "model" : "user", parts: [{ text: t.content }] })),
-      generationConfig: { maxOutputTokens: 2000 }
-    };
-    extract = d => (d.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
-  } else if (PROVIDER === "anthropic") {
-    url = "https://api.anthropic.com/v1/messages";
-    headers = { "Content-Type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01" };
-    payload = { model: MODEL, max_tokens: 1000, system: instructions, messages: turns };
-    extract = d => (d.content || []).filter(c => c.type === "text").map(c => c.text).join("\n");
-  } else {
-    url = "https://api.openai.com/v1/responses";
-    headers = { "Authorization": `Bearer ${API_KEY}`, "Content-Type": "application/json" };
-    payload = { model: MODEL, instructions, input: turns, max_output_tokens: 1000 };
-    extract = d => d.output_text || (d.output || []).flatMap(o => o.content || []).filter(c => c.type === "output_text").map(c => c.text).join("\n");
-  }
-  // Retry on temporary provider overload (500/502/503/504) before giving up
-  let response, data;
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    response = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
-    data = await response.json().catch(() => ({}));
-    if (response.ok || ![500, 502, 503, 504].includes(response.status) || attempt === 4) break;
-    console.warn(`[AI ${PROVIDER}] ${response.status}, retry ${attempt}/3...`);
-    await new Promise(r => setTimeout(r, attempt * 2000));
-  }
+  const messages = [
+    { role: "system", content: instructions },
+    ...safeHistory,
+    { role: "user", content: String(message || "").slice(0, 3500) }
+  ];
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: MODEL, messages, max_tokens: 700, temperature: 0.7 })
+  });
+  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const detail = data?.error?.message || data?.error || "AI_REQUEST_FAILED";
-    console.error(`[AI ${PROVIDER}] ${response.status}:`, typeof detail === "string" ? detail : JSON.stringify(detail));
-    const error = new Error(typeof detail === "string" ? detail : "AI_REQUEST_FAILED");
-    error.status = response.status === 429 ? 429 : response.status === 503 ? 503 : 502;
+    // Keep the provider's actual error in Render Logs for debugging, without exposing secrets.
+    console.error("Groq API error:", response.status, data?.error?.code || "", data?.error?.message || "Unknown error");
+    const error = new Error(data?.error?.message || "GROQ_REQUEST_FAILED");
+    error.status = response.status === 429 ? 429 : 502;
     throw error;
   }
-  const text = extract(data);
-  return text || "Жауапты алу мүмкін болмады. Қайталап көрші.";
+  const text = data?.choices?.[0]?.message?.content;
+  return (typeof text === "string" && text.trim()) ? text.trim() : "Жауапты алу мүмкін болмады. Қайталап көрші.";
 }
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     if (req.method === "GET" && url.pathname === "/api/health") {
-      return json(res, 200, { ok: true, aiConfigured: Boolean(API_KEY), provider: PROVIDER || null, model: MODEL || null });
+      return json(res, 200, { ok: true, aiConfigured: Boolean(API_KEY), provider: "Groq", model: MODEL });
     }
     if (req.method === "GET" && url.pathname === "/api/visitors") {
       const data = await readCounter();
       return json(res, 200, { totalVisits: Number(data.totalVisits) || 0 });
     }
     if (req.method === "POST" && url.pathname === "/api/visit") {
-      return json(res, 200, { totalVisits: await incrementVisits() });
+      const data = await readCounter();
+      data.totalVisits = (Number(data.totalVisits) || 0) + 1;
+      await saveCounter(data);
+      return json(res, 200, { totalVisits: data.totalVisits });
     }
     if (req.method === "POST" && url.pathname === "/api/chat") {
       if (!rateAllowed(req)) return json(res, 429, { error: "Өте жиі сұрау жіберілді. Бір минуттан кейін қайта көр." });
@@ -168,9 +117,8 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         const status = e.status || 502;
         const msg = e.message === "AI_NOT_CONFIGURED"
-          ? "AI әлі қосылмаған. Жоба иесі .env файлына API кілтін (GEMINI_API_KEY, OPENAI_API_KEY немесе ANTHROPIC_API_KEY) қосуы керек."
+          ? "AI әлі қосылмаған. Жоба иесі серверге GROQ_API_KEY орнатуы керек."
           : status === 429 ? "AI сұранысы уақытша шектелді. Біраздан соң қайталап көр."
-          : status === 503 ? "AI қазір тым бос емес (Google жағындағы уақытша жүктеме). 1-2 минуттан кейін қайталап көр."
           : "AI қызметіне қосылу сәтсіз аяқталды. API кілтін, интернетті және есептік жазба баптауларын тексер.";
         return json(res, status, { error: msg });
       }
@@ -188,4 +136,4 @@ const server = http.createServer(async (req, res) => {
     else res.end();
   }
 });
-server.listen(PORT, () => console.log(`Dulati Lingua AI running at http://localhost:${PORT} | AI: ${API_KEY ? PROVIDER + " / " + MODEL : "NOT CONFIGURED (add a key to .env)"}`));
+server.listen(PORT, () => console.log(`Dulati Lingua AI running at http://localhost:${PORT}`));
