@@ -9,7 +9,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const COUNTER_FILE = path.join(DATA_DIR, "visitors.json");
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = process.env.GROQ_API_KEY || "";
-const MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const mime = {
   ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
   ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8",
